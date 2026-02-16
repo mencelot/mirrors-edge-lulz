@@ -1,10 +1,27 @@
 # Mirror's Edge Camera Proxy for RTX Remix
 
-A D3D9 proxy DLL that sits between Mirror's Edge (Unreal Engine 3) and NVIDIA RTX Remix, providing the View and Projection matrices that Remix needs to render path-traced lighting correctly.
+~2,000 lines of C++ that exist because a game from 2008 won't call two functions.
 
-## The Problem
+## Why This Exists
 
-Mirror's Edge uses UE3's shader-based rendering pipeline. The game never calls the fixed-function `SetTransform(D3DTS_VIEW, ...)` or `SetTransform(D3DTS_PROJECTION, ...)` APIs -- it uploads a combined ViewProjection matrix directly to vertex shader constant registers via `SetVertexShaderConstantF`. RTX Remix requires separate View and Projection matrices set through the fixed-function pipeline in order to understand the 3D scene. Without them, Remix has no camera information and cannot perform ray tracing.
+RTX Remix can path-trace any Direct3D 9 game. It just needs two things from the game's rendering pipeline:
+
+```cpp
+SetTransform(D3DTS_VIEW, &viewMatrix);
+SetTransform(D3DTS_PROJECTION, &projMatrix);
+```
+
+That's it. Two API calls. Every other game from that era calls them as part of the standard fixed-function pipeline. But Unreal Engine 3 said "nah, we're modern, we'll shove a combined ViewProjection matrix into shader constants as raw floats" -- and now, 18 years later, someone has to write a forensic analysis tool that:
+
+1. **Watches every single float upload to the GPU** via `SetVertexShaderConstantF`
+2. **Asks "is this... a camera?"** by checking if a specific diagonal of 16 floats has unit magnitude
+3. **Scores candidates like a judge at the Olympics** (6-14 points for perspective row normalization, FOV plausibility, and translation magnitude)
+4. **Waits three frames** to make sure the camera is actually *moving* before committing
+5. **Reverse-engineers the camera position** from `f[15] = -dot(forward, eye_position)`
+6. **Decomposes the matrix** back into the two separate transforms Remix wanted all along
+7. **Reconstructs per-object World matrices** by multiplying every draw call's MVP by the inverse of the detected VP
+
+All so Remix can do its magic.
 
 ## How It Works
 
