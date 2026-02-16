@@ -1,11 +1,23 @@
 /**
  * Mirror's Edge Camera Proxy for RTX Remix
  *
- * Auto-detects the ViewProjection matrix from vertex shader constants,
- * decomposes it into View + Projection, and feeds both to RTX Remix.
+ * This proxy DLL intercepts D3D9 calls, extracts camera matrices from
+ * vertex shader constants, and provides them to RTX Remix via SetTransform().
+ *
+ * Mirror's Edge uses Unreal Engine 3 which typically uses:
+ *   c0-c3:   LocalToWorld (World) matrix
+ *   c4-c7:   ViewProjection or View matrix
+ *   c8-c11:  WorldViewProjection matrix
+ *
+ * This version has LOGGING ENABLED to discover the actual register layout.
  *
  * Build with Visual Studio Developer Command Prompt (x86):
- *   do_build.bat
+ *   build.bat
+ *
+ * Setup:
+ * 1. Rename Remix's d3d9.dll to d3d9_remix.dll
+ * 2. Place this compiled d3d9.dll in the game's Binaries folder
+ * 3. Run game and check camera_proxy.log for register analysis
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -13,17 +25,24 @@
 #include <d3d9.h>
 #include <cstdio>
 #include <cmath>
-#include <cstring>
 
 #pragma comment(lib, "user32.lib")
 
 // Configuration
 struct ProxyConfig {
+    // Mirror's Edge confirmed layout:
+    // c5-c8 = View matrix (rotation rows + translation)
+    // c0-c3 = WorldViewProjection (not used directly)
+    int viewMatrixRegister = 5;      // c5-c8 confirmed from log analysis
+    int projMatrixRegister = -1;     // No separate projection - synthesize 90deg FOV
+    int worldMatrixRegister = -1;    // Not needed
     bool enableLogging = true;
-    int diagnosticFrames = 10;   // Log all candidates for N frames after first candidate seen
-    float aspect = 16.0f / 9.0f; // Display aspect ratio
-    float zNear = 10.0f;
-    float zFar = 100000.0f;
+    float minFOV = 0.1f;
+    float maxFOV = 2.5f;
+
+    // Reduced logging now that registers are known
+    bool logAllConstants = false;    // Disable verbose logging
+    bool autoDetectMatrices = false; // Disable - we know the layout now
 };
 
 static ProxyConfig g_config;
@@ -55,6 +74,7 @@ static D3DPERF_SetRegion_t g_origD3DPERF_SetRegion = nullptr;
 // Logging helper
 void LogMsg(const char* fmt, ...) {
     if (!g_config.enableLogging || !g_logFile) return;
+
     va_list args;
     va_start(args, fmt);
     vfprintf(g_logFile, fmt, args);
@@ -63,223 +83,113 @@ void LogMsg(const char* fmt, ...) {
     va_end(args);
 }
 
-// ---- Matrix math helpers ----
-
-void MultiplyMatrix4x4(const float* A, const float* B, float* out) {
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; k++) {
-                sum += A[r * 4 + k] * B[k * 4 + c];
-            }
-            out[r * 4 + c] = sum;
-        }
+// Check if matrix values are valid
+bool LooksLikeMatrix(const float* data) {
+    float sum = 0;
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(data[i])) return false;
+        sum += fabsf(data[i]);
     }
+    if (sum < 0.001f || sum > 100000.0f) return false;
+    return true;
 }
 
-void TransposeMatrix4x4(const float* in, float* out) {
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++)
-            out[c * 4 + r] = in[r * 4 + c];
+// Extract FOV from projection matrix
+float ExtractFOV(const D3DMATRIX& proj) {
+    if (fabsf(proj._22) < 0.001f) return 0;
+    return 2.0f * atanf(1.0f / proj._22);
 }
 
+// Check if matrix looks like projection
+bool LooksLikeProjection(const D3DMATRIX& m) {
+    // Check for typical projection structure
+    if (fabsf(m._12) > 0.01f || fabsf(m._13) > 0.01f || fabsf(m._14) > 0.01f) return false;
+    if (fabsf(m._21) > 0.01f || fabsf(m._23) > 0.01f || fabsf(m._24) > 0.01f) return false;
+    if (fabsf(m._31) > 0.01f || fabsf(m._32) > 0.01f) return false;
+    if (fabsf(m._11) < 0.01f || fabsf(m._22) < 0.01f) return false;
+
+    float fov = ExtractFOV(m);
+    if (fov < g_config.minFOV || fov > g_config.maxFOV) return false;
+
+    return true;
+}
+
+// Create a standard perspective projection matrix
+void CreateProjectionMatrix(D3DMATRIX* out, float fovY, float aspect, float zNear, float zFar) {
+    float yScale = 1.0f / tanf(fovY / 2.0f);
+    float xScale = yScale / aspect;
+    memset(out, 0, sizeof(D3DMATRIX));
+    out->_11 = xScale;
+    out->_22 = yScale;
+    out->_33 = zFar / (zFar - zNear);
+    out->_34 = 1.0f;
+    out->_43 = -zNear * zFar / (zFar - zNear);
+}
+
+// Create an identity matrix
 void CreateIdentityMatrix(D3DMATRIX* out) {
     memset(out, 0, sizeof(D3DMATRIX));
     out->_11 = out->_22 = out->_33 = out->_44 = 1.0f;
 }
 
-// Multiply two D3DMATRIX (row-vector convention: result = A * B)
-void MultiplyD3D(const D3DMATRIX* A, const D3DMATRIX* B, D3DMATRIX* out) {
-    MultiplyMatrix4x4((const float*)A, (const float*)B, (float*)out);
-}
+// Check if matrix looks like view matrix (orthonormal rotation + translation)
+bool LooksLikeView(const D3DMATRIX& m) {
+    float row0len = sqrtf(m._11*m._11 + m._12*m._12 + m._13*m._13);
+    float row1len = sqrtf(m._21*m._21 + m._22*m._22 + m._23*m._23);
+    float row2len = sqrtf(m._31*m._31 + m._32*m._32 + m._33*m._33);
 
-// Invert a rigid-body View matrix (orthonormal rotation + translation)
-// V = | R  0 |    V^-1 = | R^T          0 |
-//     | t  1 |            | -t*R^T       1 |
-void InvertView(const D3DMATRIX* V, D3DMATRIX* out) {
-    memset(out, 0, sizeof(D3DMATRIX));
-    // Transpose the 3x3 rotation
-    out->_11 = V->_11; out->_12 = V->_21; out->_13 = V->_31;
-    out->_21 = V->_12; out->_22 = V->_22; out->_23 = V->_32;
-    out->_31 = V->_13; out->_32 = V->_23; out->_33 = V->_33;
-    // Translation: -t * R^T
-    float tx = V->_41, ty = V->_42, tz = V->_43;
-    out->_41 = -(tx*out->_11 + ty*out->_21 + tz*out->_31);
-    out->_42 = -(tx*out->_12 + ty*out->_22 + tz*out->_32);
-    out->_43 = -(tx*out->_13 + ty*out->_23 + tz*out->_33);
-    out->_44 = 1.0f;
-}
+    if (fabsf(row0len - 1.0f) > 0.1f) return false;
+    if (fabsf(row1len - 1.0f) > 0.1f) return false;
+    if (fabsf(row2len - 1.0f) > 0.1f) return false;
 
-// Invert D3D LH perspective projection
-// P = | xS  0   0   0 |    P^-1 = | 1/xS  0     0     0    |
-//     | 0   yS  0   0 |            | 0     1/yS  0     0    |
-//     | 0   0   A   1 |            | 0     0     0     1/B  |
-//     | 0   0   B   0 |            | 0     0     1    -A/B  |
-void InvertProj(const D3DMATRIX* P, D3DMATRIX* out) {
-    memset(out, 0, sizeof(D3DMATRIX));
-    float xS = P->_11, yS = P->_22, A = P->_33, B = P->_43;
-    if (fabsf(xS) < 0.0001f || fabsf(yS) < 0.0001f || fabsf(B) < 0.0001f) {
-        CreateIdentityMatrix(out);
-        return;
-    }
-    out->_11 = 1.0f / xS;
-    out->_22 = 1.0f / yS;
-    out->_34 = 1.0f / B;
-    out->_43 = 1.0f;
-    out->_44 = -A / B;
-}
-
-// ---- Column-major VP detection for UE3 ----
-//
-// UE3 stores matrices COLUMN-MAJOR in shader constant registers:
-//   c0 = f[0..3]   = column 0
-//   c1 = f[4..7]   = column 1
-//   c2 = f[8..11]  = column 2
-//   c3 = f[12..15] = column 3
-//
-// For VP = Proj * View (column-vector convention), the "perspective row"
-// (row 3 in column-major = {f[3], f[7], f[11], f[15]}) contains:
-//   {f[3], f[7], f[11]} = camera forward direction (unit vec for identity-World)
-//   f[15] = -dot(forward, eye_position) = camera distance
-//
-// Cross-register rows give projection-scaled view axes:
-//   Row 0: {f[0], f[4], f[8], f[12]} = xS * (right, -right·eye)
-//   Row 1: {f[1], f[5], f[9], f[13]} = yS * (up, -up·eye)
-
-int ScoreAsVP(const float* f) {
-    for (int i = 0; i < 16; i++) {
-        if (!isfinite(f[i])) return 0;
-    }
-
-    int score = 0;
-
-    // "Perspective row" xyz magnitude: camera forward direction
-    // For identity-World VP, this should be ~1.0 (unit forward vector)
-    float prMag = sqrtf(f[3]*f[3] + f[7]*f[7] + f[11]*f[11]);
-    if (prMag >= 0.8f && prMag <= 1.2f) score += 5;
-    else return 0; // Hard requirement: perspective row must be ~unit length
-
-    // Bonus for very close to 1.0 (identity World, most accurate VP)
-    if (fabsf(prMag - 1.0f) < 0.05f) score += 3;
-
-    // Projection scales from cross-register row magnitudes
-    float xS = sqrtf(f[0]*f[0] + f[4]*f[4] + f[8]*f[8]);
-    float yS = sqrtf(f[1]*f[1] + f[5]*f[5] + f[9]*f[9]);
-
-    // Realistic projection: FOV between ~30deg and ~140deg
-    if (xS >= 0.3f && xS <= 5.0f) score += 2;
-    else return 0;
-
-    if (yS >= 0.3f && yS <= 5.0f) score += 2;
-    else return 0;
-
-    // f[15] = -dot(forward, eye) = camera distance, should be substantial
-    if (fabsf(f[15]) > 10.0f) score += 2;
-
-    return score;
-}
-
-// Decompose column-major UE3 VP into D3D row-vector View + Projection for Remix.
-//
-// From column-major VP = Proj * View:
-//   Row 0: {f[0], f[4], f[8]}  = xS * right_direction
-//   Row 1: {f[1], f[5], f[9]}  = yS * up_direction
-//   Row 3: {f[3], f[7], f[11]} = forward_direction (perspective row)
-//   f[12] = -xS * dot(right, eye)
-//   f[13] = -yS * dot(up, eye)
-//   f[15] = -dot(forward, eye)
-bool DecomposeVP_ColMajor(const float* vp, D3DMATRIX* viewOut, D3DMATRIX* projOut, D3DMATRIX* gameProjOut) {
-    // Extract projection scales from cross-register rows
-    float xS = sqrtf(vp[0]*vp[0] + vp[4]*vp[4] + vp[8]*vp[8]);
-    float yS = sqrtf(vp[1]*vp[1] + vp[5]*vp[5] + vp[9]*vp[9]);
-
-    if (xS < 0.001f || yS < 0.001f) return false;
-
-    // Right direction (normalize row 0 xyz)
-    float rx = vp[0] / xS, ry = vp[4] / xS, rz = vp[8] / xS;
-
-    // Up direction (normalize row 1 xyz)
-    float ux = vp[1] / yS, uy = vp[5] / yS, uz = vp[9] / yS;
-
-    // Forward direction from perspective row (row 3 xyz)
-    float fwdMag = sqrtf(vp[3]*vp[3] + vp[7]*vp[7] + vp[11]*vp[11]);
-    if (fwdMag < 0.001f) return false;
-    float fx = vp[3] / fwdMag, fy = vp[7] / fwdMag, fz = vp[11] / fwdMag;
-
-    // Camera position from dot products
-    float rDotEye = -vp[12] / xS;
-    float uDotEye = -vp[13] / yS;
-    float fDotEye = -vp[15];
-
-    // Reconstruct eye position: eye = rDotEye*right + uDotEye*up + fDotEye*forward
-    float eyeX = rDotEye * rx + uDotEye * ux + fDotEye * fx;
-    float eyeY = rDotEye * ry + uDotEye * uy + fDotEye * fy;
-    float eyeZ = rDotEye * rz + uDotEye * uz + fDotEye * fz;
-
-    // Build D3D LH row-vector View matrix
-    // In D3D row-vector convention: viewPos = worldPos * View
-    // View = | rx   ux   fx   0 |
-    //        | ry   uy   fy   0 |
-    //        | rz   uz   fz   0 |
-    //        | tx   ty   tz   1 |
-    // where tx = -dot(right, eye), ty = -dot(up, eye), tz = -dot(fwd, eye)
-    float tx = -(rx*eyeX + ry*eyeY + rz*eyeZ);
-    float ty = -(ux*eyeX + uy*eyeY + uz*eyeZ);
-    float tz = -(fx*eyeX + fy*eyeY + fz*eyeZ);
-
-    memset(viewOut, 0, sizeof(D3DMATRIX));
-    viewOut->_11 = rx;  viewOut->_12 = ux;  viewOut->_13 = fx;  viewOut->_14 = 0;
-    viewOut->_21 = ry;  viewOut->_22 = uy;  viewOut->_23 = fy;  viewOut->_24 = 0;
-    viewOut->_31 = rz;  viewOut->_32 = uz;  viewOut->_33 = fz;  viewOut->_34 = 0;
-    viewOut->_41 = tx;  viewOut->_42 = ty;  viewOut->_43 = tz;  viewOut->_44 = 1.0f;
-
-    // Log game's actual projection parameters (Row 2 cross-register = A * forward)
-    static bool loggedProj = false;
-    if (!loggedProj) {
-        float r2Mag = sqrtf(vp[2]*vp[2] + vp[6]*vp[6] + vp[10]*vp[10]);
-        float A_game = r2Mag;
-        float B_game = vp[14] - A_game * vp[15];
-        LogMsg("GAME PROJ: A=%.4f B=%.2f xS=%.4f yS=%.4f (zNear_est=%.1f zFar_est=%.1f)",
-               A_game, B_game, xS, yS,
-               (fabsf(A_game) > 0.001f) ? -B_game/A_game : 0.0f,
-               (fabsf(A_game-1.0f) > 0.001f) ? (-B_game/A_game)*A_game/(A_game-1.0f) : 999999.0f);
-        loggedProj = true;
-    }
-
-    // Use synthetic projection with reasonable depth range for Remix
-    // (Game's A=4.34 gives zNear~=camera_distance which clips everything)
-    float zN = g_config.zNear;   // default 10.0
-    float zF = g_config.zFar;    // default 100000.0
-    float A_synth = zF / (zF - zN);
-    float B_synth = -zN * zF / (zF - zN);
-
-    memset(projOut, 0, sizeof(D3DMATRIX));
-    projOut->_11 = xS;
-    projOut->_22 = yS;
-    projOut->_33 = A_synth;
-    projOut->_34 = 1.0f;
-    projOut->_43 = B_synth;
-
-    // Also output game's ACTUAL projection (for accurate VP^-1 computation)
-    float r2Mag = sqrtf(vp[2]*vp[2] + vp[6]*vp[6] + vp[10]*vp[10]);
-    float A_game = r2Mag;
-    float B_game = vp[14] - A_game * vp[15];
-    memset(gameProjOut, 0, sizeof(D3DMATRIX));
-    gameProjOut->_11 = xS;
-    gameProjOut->_22 = yS;
-    gameProjOut->_33 = A_game;
-    gameProjOut->_34 = 1.0f;
-    gameProjOut->_43 = B_game;
+    if (fabsf(m._14) > 0.01f || fabsf(m._24) > 0.01f || fabsf(m._34) > 0.01f) return false;
+    if (fabsf(m._44 - 1.0f) > 0.01f) return false;
 
     return true;
+}
+
+// Check if matrix could be ViewProjection (has projection-like characteristics but rotation too)
+bool LooksLikeViewProjection(const D3DMATRIX& m) {
+    // ViewProj will have large values due to projection multiplication
+    // Check for non-zero values in typical projection positions
+    if (fabsf(m._34) < 0.5f) return false;  // Perspective divide indicator
+    if (fabsf(m._44) > 0.1f) return false;  // Should be ~0 for perspective
+
+    // Should have some rotation component
+    float magnitude = sqrtf(m._11*m._11 + m._12*m._12 + m._13*m._13);
+    if (magnitude < 0.1f) return false;
+
+    return true;
+}
+
+// Try to extract View from ViewProjection by removing projection component
+void ExtractViewFromViewProjection(const D3DMATRIX& vp, D3DMATRIX* viewOut) {
+    CreateIdentityMatrix(viewOut);
+
+    // The ViewProjection combines View and Projection
+    // We need to approximately invert the projection influence
+    // For a typical projection, _11 and _22 contain the FOV scaling
+
+    float r0len = sqrtf(vp._11*vp._11 + vp._12*vp._12 + vp._13*vp._13);
+    float r1len = sqrtf(vp._21*vp._21 + vp._22*vp._22 + vp._23*vp._23);
+    float r2len = sqrtf(vp._31*vp._31 + vp._32*vp._32 + vp._33*vp._33);
+
+    if (r0len > 0.001f && r1len > 0.001f && r2len > 0.001f) {
+        // Normalize to approximate rotation
+        viewOut->_11 = vp._11 / r0len; viewOut->_12 = vp._12 / r0len; viewOut->_13 = vp._13 / r0len;
+        viewOut->_21 = vp._21 / r1len; viewOut->_22 = vp._22 / r1len; viewOut->_23 = vp._23 / r1len;
+        viewOut->_31 = vp._31 / r2len; viewOut->_32 = vp._32 / r2len; viewOut->_33 = vp._33 / r2len;
+
+        // Translation approximation
+        viewOut->_41 = vp._14 / r0len;
+        viewOut->_42 = vp._24 / r1len;
+        viewOut->_43 = vp._34 / r2len;
+    }
 }
 
 // Forward declarations
 class WrappedD3D9Device;
 class WrappedD3D9;
-
-// Detection state
-enum DetectState { SCANNING, LOCKED };
 
 /**
  * Wrapped IDirect3DDevice9 - intercepts SetVertexShaderConstantF
@@ -287,45 +197,20 @@ enum DetectState { SCANNING, LOCKED };
 class WrappedD3D9Device : public IDirect3DDevice9 {
 private:
     IDirect3DDevice9* m_real;
-
-    // Auto-detect state
-    DetectState m_detectState = SCANNING;
-    int m_vpRegister = 0;           // Register where MVP/VP is uploaded (default c0 for UE3)
-    int m_consecutiveFrames = 0;    // Frames with consistent VP at this register
-    float m_prevVP44 = 0.0f;       // Previous frame's _44 value (tracks camera Z movement)
-
-    // Per-frame best VP candidate from c0
-    float m_frameBestVP[16];
-    int m_frameBestScore = 0;
-    bool m_hasFrameCandidate = false;
-
-    // Diagnostic
-    int m_diagStartFrame = -1;
-    int m_diagLogsThisFrame = 0;
-
-    // Decomposed matrices
-    D3DMATRIX m_lastView;
-    D3DMATRIX m_lastProj;       // Synthetic proj for Remix (reasonable zNear/zFar)
-    D3DMATRIX m_lastGameProj;   // Game's actual proj (for VP^-1 computation)
-    D3DMATRIX m_pendingView;
-    D3DMATRIX m_pendingProj;
-    D3DMATRIX m_pendingGameProj;
-    D3DMATRIX m_vpInverse;      // (GameProj * View)^-1 for World extraction
-    bool m_hasCamera = false;
-    bool m_pendingUpdate = false;
-    bool m_hasVPInverse = false;
-    int m_worldLogCount = 0;    // Diagnostic: count World matrix logs
+    D3DMATRIX m_lastViewMatrix;
+    D3DMATRIX m_lastProjMatrix;
+    D3DMATRIX m_pendingViewMatrix;  // Captured during frame
+    bool m_hasView = false;
+    bool m_hasProj = false;
+    bool m_pendingViewUpdate = false;  // Flag for once-per-frame update
+    bool m_capturedThisFrame = false;  // Only capture FIRST camera per frame
+    int m_constantLogThrottle = 0;
+    int m_loggedThisFrame = 0;
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
-        memset(&m_lastView, 0, sizeof(D3DMATRIX));
-        memset(&m_lastProj, 0, sizeof(D3DMATRIX));
-        memset(&m_pendingView, 0, sizeof(D3DMATRIX));
-        memset(&m_pendingProj, 0, sizeof(D3DMATRIX));
-        memset(&m_lastGameProj, 0, sizeof(D3DMATRIX));
-        memset(&m_pendingGameProj, 0, sizeof(D3DMATRIX));
-        memset(&m_vpInverse, 0, sizeof(D3DMATRIX));
-        memset(m_frameBestVP, 0, sizeof(m_frameBestVP));
+        memset(&m_lastViewMatrix, 0, sizeof(D3DMATRIX));
+        memset(&m_lastProjMatrix, 0, sizeof(D3DMATRIX));
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 
@@ -335,12 +220,19 @@ public:
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
-        return m_real->QueryInterface(riid, ppvObj);
+        HRESULT hr = m_real->QueryInterface(riid, ppvObj);
+        return hr;
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return m_real->AddRef();
+    }
+
     ULONG STDMETHODCALLTYPE Release() override {
         ULONG count = m_real->Release();
-        if (count == 0) delete this;
+        if (count == 0) {
+            delete this;
+        }
         return count;
     }
 
@@ -350,92 +242,71 @@ public:
         const float* pConstantData,
         UINT Vector4fCount) override
     {
-        // Check if this upload covers the VP register (c0-c3 for UE3)
-        if (Vector4fCount >= 4 && pConstantData &&
-            StartRegister <= (UINT)m_vpRegister &&
-            StartRegister + Vector4fCount >= (UINT)(m_vpRegister + 4))
-        {
-            int offset = (m_vpRegister - (int)StartRegister) * 4;
-            const float* block = pConstantData + offset;
+        // MIRROR'S EDGE: View matrix is at c5-c8
+        // Format: c5=RotRow0, c6=RotRow1, c7=RotRow2, c8=[Tx,Ty,Tz,1]
+        if (StartRegister <= 5 && StartRegister + Vector4fCount >= 9) {
+            // c5-c8 is within this update
+            int offset = (5 - StartRegister) * 4;
+            const float* viewData = pConstantData + offset;
 
-            int score = ScoreAsVP(block);
+            // Validate it looks like a proper view matrix
+            float row0len = sqrtf(viewData[0]*viewData[0] + viewData[1]*viewData[1] + viewData[2]*viewData[2]);
+            float row1len = sqrtf(viewData[4]*viewData[4] + viewData[5]*viewData[5] + viewData[6]*viewData[6]);
+            float row2len = sqrtf(viewData[8]*viewData[8] + viewData[9]*viewData[9] + viewData[10]*viewData[10]);
 
-            // Diagnostic logging
-            bool inDiagWindow = (m_diagStartFrame >= 0 &&
-                                 g_frameCount < m_diagStartFrame + g_config.diagnosticFrames);
-            if (score > 0 && m_diagStartFrame < 0) {
-                m_diagStartFrame = g_frameCount;
-                inDiagWindow = true;
-                LogMsg("=== DIAGNOSTIC START frame %d (column-major VP detect) ===", g_frameCount);
-            }
-            if (inDiagWindow && m_diagLogsThisFrame < 15) {
-                float prMag = sqrtf(block[3]*block[3]+block[7]*block[7]+block[11]*block[11]);
-                float xS = sqrtf(block[0]*block[0]+block[4]*block[4]+block[8]*block[8]);
-                float yS = sqrtf(block[1]*block[1]+block[5]*block[5]+block[9]*block[9]);
-                LogMsg("  [c0] F%d s=%d prMag=%.3f xS=%.3f yS=%.3f f15=%.1f eye=[%.1f,%.1f,%.1f]",
-                       g_frameCount, score, prMag, xS, yS, block[15],
-                       block[12], block[13], block[14]);
-                m_diagLogsThisFrame++;
-            }
+            // Check for orthonormal rotation (all row lengths ~1.0) and valid w components
+            bool isValidView = (fabsf(row0len - 1.0f) < 0.15f) &&
+                              (fabsf(row1len - 1.0f) < 0.15f) &&
+                              (fabsf(row2len - 1.0f) < 0.15f) &&
+                              (fabsf(viewData[3]) < 0.01f) &&   // c5.w = 0
+                              (fabsf(viewData[7]) < 0.01f) &&   // c6.w = 0
+                              (fabsf(viewData[11]) < 0.01f) &&  // c7.w = 0
+                              (fabsf(viewData[15] - 1.0f) < 0.01f); // c8.w = 1
 
-            // Track best VP candidate this frame (highest score)
-            if (score > m_frameBestScore) {
-                m_frameBestScore = score;
-                memcpy(m_frameBestVP, block, 16 * sizeof(float));
-                m_hasFrameCandidate = true;
-            }
+            if (isValidView) {
+                // Copy the view matrix
+                D3DMATRIX viewMat;
+                memcpy(&viewMat, viewData, sizeof(D3DMATRIX));
 
-            // In LOCKED mode: decompose VP, compute per-draw World
-            if (m_detectState == LOCKED) {
-                if (score >= 6) {
-                    D3DMATRIX view, proj, gameProj;
-                    if (DecomposeVP_ColMajor(block, &view, &proj, &gameProj)) {
-                        memcpy(&m_pendingView, &view, sizeof(D3DMATRIX));
-                        memcpy(&m_pendingProj, &proj, sizeof(D3DMATRIX));
-                        memcpy(&m_pendingGameProj, &gameProj, sizeof(D3DMATRIX));
-                        m_pendingUpdate = true;
+                // Check if this is a real 3D camera (not UI - has non-trivial translation)
+                float transMag = sqrtf(viewMat._41*viewMat._41 + viewMat._42*viewMat._42 + viewMat._43*viewMat._43);
 
-                        if (!m_hasCamera) {
-                            LogMsg("FIRST CAMERA: view=[%.1f,%.1f,%.1f] proj=[%.3f,%.3f] gameA=%.4f",
-                                   view._41, view._42, view._43, proj._11, proj._22, gameProj._33);
-                            memcpy(&m_lastView, &view, sizeof(D3DMATRIX));
-                            memcpy(&m_lastProj, &proj, sizeof(D3DMATRIX));
-                            memcpy(&m_lastGameProj, &gameProj, sizeof(D3DMATRIX));
-                            m_hasCamera = true;
-                            m_real->SetTransform(D3DTS_VIEW, &m_lastView);
-                            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProj);
-                            // Compute VP^-1 using game's REAL projection
-                            D3DMATRIX viewInv, gameProjInv;
-                            InvertView(&m_lastView, &viewInv);
-                            InvertProj(&m_lastGameProj, &gameProjInv);
-                            MultiplyD3D(&gameProjInv, &viewInv, &m_vpInverse);
-                            m_hasVPInverse = true;
-                            LogMsg("VP^-1 computed (gameA=%.4f gameB=%.2f)", m_lastGameProj._33, m_lastGameProj._43);
-                        }
+                // Only use if translation magnitude suggests 3D world (> 100 units typically)
+                // AND we haven't captured a camera this frame yet (avoid shadow/reflection cameras)
+                if (transMag > 50.0f && !m_capturedThisFrame) {
+                    // Store pending view - will apply once per frame in Present()
+                    memcpy(&m_pendingViewMatrix, &viewMat, sizeof(D3DMATRIX));
+                    m_pendingViewUpdate = true;
+                    m_capturedThisFrame = true;  // Only capture FIRST camera per frame
+
+                    // Create projection if we don't have one (90 degree FOV, matching ME's typical FOV)
+                    if (!m_hasProj) {
+                        CreateProjectionMatrix(&m_lastProjMatrix, 1.5708f, 16.0f/9.0f, 10.0f, 100000.0f);
+                        m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+                        m_hasProj = true;
+                    }
+
+                    if (!m_hasView) {
+                        LogMsg("ME: Found VIEW at c5-c8, trans=[%.1f, %.1f, %.1f]",
+                               viewMat._41, viewMat._42, viewMat._43);
+                        m_hasView = true;
+                        // Set initial view immediately
+                        memcpy(&m_lastViewMatrix, &viewMat, sizeof(D3DMATRIX));
+                        m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+                        D3DMATRIX identity;
+                        CreateIdentityMatrix(&identity);
+                        m_real->SetTransform(D3DTS_WORLD, &identity);
                     }
                 }
+            }
+        }
 
-                // Per-draw World: only for full-res c0 uploads (f[14] non-zero)
-                // f[14] = A*tz+B for full-res pass, ~0 for half-res (eye.z stripped)
-                if (m_hasVPInverse && fabsf(block[14]) > 1.0f) {
-                    float mvpD3D[16];
-                    TransposeMatrix4x4(block, mvpD3D);
-                    D3DMATRIX world;
-                    MultiplyMatrix4x4(mvpD3D, (const float*)&m_vpInverse, (float*)&world);
-                    m_real->SetTransform(D3DTS_WORLD, &world);
-                    // Log first few World matrices for diagnostic
-                    if (m_worldLogCount < 5) {
-                        LogMsg("WORLD[%d]: diag=[%.3f,%.3f,%.3f,%.3f] trans=[%.1f,%.1f,%.1f]",
-                               m_worldLogCount, world._11, world._22, world._33, world._44,
-                               world._41, world._42, world._43);
-                        m_worldLogCount++;
-                    }
-                } else if (m_hasVPInverse) {
-                    // Half-res pass or non-VP: set identity World
-                    D3DMATRIX identity;
-                    CreateIdentityMatrix(&identity);
-                    m_real->SetTransform(D3DTS_WORLD, &identity);
-                }
+        // Optional: Log for debugging (throttled)
+        if (g_config.logAllConstants && m_constantLogThrottle == 0 && Vector4fCount >= 4) {
+            if (m_loggedThisFrame < 10) {
+                m_loggedThisFrame++;
+                LogMsg("Frame %d: c%d-%d (%d vec4s)", g_frameCount,
+                       StartRegister, StartRegister + Vector4fCount - 1, Vector4fCount);
             }
         }
 
@@ -445,83 +316,31 @@ public:
     // Present - per-frame operations
     HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
                                        HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
-        // SCANNING -> LOCKED transition
-        if (m_detectState == SCANNING && m_hasFrameCandidate) {
-            // Check if _44 changed from previous frame (camera Z is moving)
-            float d44 = fabsf(m_frameBestVP[15] - m_prevVP44);
-            if (d44 > 0.01f) {
-                m_consecutiveFrames++;
-            }
-
-            bool inDiagWindow = (m_diagStartFrame >= 0 && g_frameCount < m_diagStartFrame + g_config.diagnosticFrames);
-            if (inDiagWindow) {
-                LogMsg("  Frame %d: bestScore=%d _44=%.1f d44=%.3f consec=%d",
-                       g_frameCount, m_frameBestScore, m_frameBestVP[15], d44, m_consecutiveFrames);
-            }
-
-            m_prevVP44 = m_frameBestVP[15];
-
-            // Lock after 3 frames of changing _44 (camera Z moving = real 3D camera)
-            if (m_consecutiveFrames >= 3) {
-                m_detectState = LOCKED;
-                float lockPrMag = sqrtf(m_frameBestVP[3]*m_frameBestVP[3]+m_frameBestVP[7]*m_frameBestVP[7]+m_frameBestVP[11]*m_frameBestVP[11]);
-                LogMsg("*** LOCKED on c%d-c%d as VP (col-major, prMag=%.3f, f15=%.1f) ***",
-                       m_vpRegister, m_vpRegister + 3, lockPrMag, m_frameBestVP[15]);
-
-                // Decompose immediately
-                D3DMATRIX view, proj, gameProj;
-                if (DecomposeVP_ColMajor(m_frameBestVP, &view, &proj, &gameProj)) {
-                    memcpy(&m_lastView, &view, sizeof(D3DMATRIX));
-                    memcpy(&m_lastProj, &proj, sizeof(D3DMATRIX));
-                    memcpy(&m_lastGameProj, &gameProj, sizeof(D3DMATRIX));
-                    m_hasCamera = true;
-                    m_real->SetTransform(D3DTS_VIEW, &m_lastView);
-                    m_real->SetTransform(D3DTS_PROJECTION, &m_lastProj);
-                    // Compute VP^-1 using game's real projection
-                    D3DMATRIX viewInv, gameProjInv;
-                    InvertView(&m_lastView, &viewInv);
-                    InvertProj(&m_lastGameProj, &gameProjInv);
-                    MultiplyD3D(&gameProjInv, &viewInv, &m_vpInverse);
-                    m_hasVPInverse = true;
-                    LogMsg("  View trans=[%.1f, %.1f, %.1f] Proj xS=%.3f yS=%.3f gameA=%.4f",
-                           view._41, view._42, view._43, proj._11, proj._22, gameProj._33);
-                }
-            }
+        // Apply pending view matrix ONCE per frame (prevents constant camera cut detection)
+        if (m_pendingViewUpdate && m_hasView) {
+            memcpy(&m_lastViewMatrix, &m_pendingViewMatrix, sizeof(D3DMATRIX));
+            m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+            m_pendingViewUpdate = false;
         }
 
-        // Apply pending camera update once per frame + recompute VP^-1
-        if (m_pendingUpdate && m_hasCamera) {
-            memcpy(&m_lastView, &m_pendingView, sizeof(D3DMATRIX));
-            memcpy(&m_lastProj, &m_pendingProj, sizeof(D3DMATRIX));
-            memcpy(&m_lastGameProj, &m_pendingGameProj, sizeof(D3DMATRIX));
-            m_real->SetTransform(D3DTS_VIEW, &m_lastView);
-            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProj);
-            // Recompute VP^-1 with game's real projection for next frame
-            D3DMATRIX viewInv, gameProjInv;
-            InvertView(&m_lastView, &viewInv);
-            InvertProj(&m_lastGameProj, &gameProjInv);
-            MultiplyD3D(&gameProjInv, &viewInv, &m_vpInverse);
-            m_hasVPInverse = true;
-            m_pendingUpdate = false;
-        }
-
-        // Reset per-frame state
-        m_hasFrameCandidate = false;
-        m_frameBestScore = 0;
-        m_diagLogsThisFrame = 0;
+        // Reset for next frame - allow capturing first camera again
+        m_capturedThisFrame = false;
 
         g_frameCount++;
+        m_loggedThisFrame = 0;
 
-        // Periodic status logging
+        // Throttle constant logging after first 10 frames (enough to see patterns)
+        if (g_config.logAllConstants && g_frameCount > 10) {
+            m_constantLogThrottle = (m_constantLogThrottle + 1) % 300; // Log every 300 frames
+        }
+
+        // Log periodic status
         if (g_frameCount % 300 == 0) {
-            LogMsg("=== Frame %d Status: state=%s hasCamera=%d vpReg=c%d ===",
-                   g_frameCount,
-                   m_detectState == LOCKED ? "LOCKED" : "SCANNING",
-                   m_hasCamera, m_vpRegister);
-            if (m_hasCamera) {
-                LogMsg("  View trans: [%.1f, %.1f, %.1f]",
-                       m_lastView._41, m_lastView._42, m_lastView._43);
-                LogMsg("  Proj: xS=%.3f yS=%.3f", m_lastProj._11, m_lastProj._22);
+            LogMsg("=== Frame %d Status: hasView=%d hasProj=%d ===",
+                   g_frameCount, m_hasView, m_hasProj);
+            if (m_hasView) {
+                LogMsg("  View matrix translation: [%.1f, %.1f, %.1f]",
+                       m_lastViewMatrix._41, m_lastViewMatrix._42, m_lastViewMatrix._43);
             }
         }
 
@@ -567,12 +386,14 @@ public:
     HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) override { return m_real->SetDepthStencilSurface(pNewZStencil); }
     HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) override { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
     HRESULT STDMETHODCALLTYPE BeginScene() override {
-        if (m_hasCamera) {
+        // Set last known camera - Remix needs this during draw calls
+        // Using m_lastViewMatrix (stable, from previous frame's Present) not pending
+        if (m_hasView && m_hasProj) {
             D3DMATRIX identity;
             CreateIdentityMatrix(&identity);
             m_real->SetTransform(D3DTS_WORLD, &identity);
-            m_real->SetTransform(D3DTS_VIEW, &m_lastView);
-            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProj);
+            m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
         }
         return m_real->BeginScene();
     }
@@ -669,39 +490,96 @@ public:
     WrappedD3D9(IDirect3D9* real) : m_real(real) {
         LogMsg("WrappedD3D9 created, wrapping IDirect3D9 at %p", real);
     }
-    ~WrappedD3D9() { LogMsg("WrappedD3D9 destroyed"); }
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override { return m_real->QueryInterface(riid, ppvObj); }
-    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ~WrappedD3D9() {
+        LogMsg("WrappedD3D9 destroyed");
+    }
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
+        return m_real->QueryInterface(riid, ppvObj);
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return m_real->AddRef();
+    }
+
     ULONG STDMETHODCALLTYPE Release() override {
         ULONG count = m_real->Release();
-        if (count == 0) delete this;
+        if (count == 0) {
+            delete this;
+        }
         return count;
     }
 
-    HRESULT STDMETHODCALLTYPE RegisterSoftwareDevice(void* pInitializeFunction) override { return m_real->RegisterSoftwareDevice(pInitializeFunction); }
-    UINT STDMETHODCALLTYPE GetAdapterCount() override { return m_real->GetAdapterCount(); }
-    HRESULT STDMETHODCALLTYPE GetAdapterIdentifier(UINT Adapter, DWORD Flags, D3DADAPTER_IDENTIFIER9* pIdentifier) override { return m_real->GetAdapterIdentifier(Adapter, Flags, pIdentifier); }
-    UINT STDMETHODCALLTYPE GetAdapterModeCount(UINT Adapter, D3DFORMAT Format) override { return m_real->GetAdapterModeCount(Adapter, Format); }
-    HRESULT STDMETHODCALLTYPE EnumAdapterModes(UINT Adapter, D3DFORMAT Format, UINT Mode, D3DDISPLAYMODE* pMode) override { return m_real->EnumAdapterModes(Adapter, Format, Mode, pMode); }
-    HRESULT STDMETHODCALLTYPE GetAdapterDisplayMode(UINT Adapter, D3DDISPLAYMODE* pMode) override { return m_real->GetAdapterDisplayMode(Adapter, pMode); }
-    HRESULT STDMETHODCALLTYPE CheckDeviceType(UINT Adapter, D3DDEVTYPE DevType, D3DFORMAT AdapterFormat, D3DFORMAT BackBufferFormat, BOOL bWindowed) override { return m_real->CheckDeviceType(Adapter, DevType, AdapterFormat, BackBufferFormat, bWindowed); }
-    HRESULT STDMETHODCALLTYPE CheckDeviceFormat(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT AdapterFormat, DWORD Usage, D3DRESOURCETYPE RType, D3DFORMAT CheckFormat) override { return m_real->CheckDeviceFormat(Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat); }
-    HRESULT STDMETHODCALLTYPE CheckDeviceMultiSampleType(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat, BOOL Windowed, D3DMULTISAMPLE_TYPE MultiSampleType, DWORD* pQualityLevels) override { return m_real->CheckDeviceMultiSampleType(Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType, pQualityLevels); }
-    HRESULT STDMETHODCALLTYPE CheckDepthStencilMatch(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT AdapterFormat, D3DFORMAT RenderTargetFormat, D3DFORMAT DepthStencilFormat) override { return m_real->CheckDepthStencilMatch(Adapter, DeviceType, AdapterFormat, RenderTargetFormat, DepthStencilFormat); }
-    HRESULT STDMETHODCALLTYPE CheckDeviceFormatConversion(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SourceFormat, D3DFORMAT TargetFormat) override { return m_real->CheckDeviceFormatConversion(Adapter, DeviceType, SourceFormat, TargetFormat); }
-    HRESULT STDMETHODCALLTYPE GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9* pCaps) override { return m_real->GetDeviceCaps(Adapter, DeviceType, pCaps); }
-    HMONITOR STDMETHODCALLTYPE GetAdapterMonitor(UINT Adapter) override { return m_real->GetAdapterMonitor(Adapter); }
+    // IDirect3D9 methods
+    HRESULT STDMETHODCALLTYPE RegisterSoftwareDevice(void* pInitializeFunction) override {
+        return m_real->RegisterSoftwareDevice(pInitializeFunction);
+    }
 
+    UINT STDMETHODCALLTYPE GetAdapterCount() override {
+        return m_real->GetAdapterCount();
+    }
+
+    HRESULT STDMETHODCALLTYPE GetAdapterIdentifier(UINT Adapter, DWORD Flags, D3DADAPTER_IDENTIFIER9* pIdentifier) override {
+        return m_real->GetAdapterIdentifier(Adapter, Flags, pIdentifier);
+    }
+
+    UINT STDMETHODCALLTYPE GetAdapterModeCount(UINT Adapter, D3DFORMAT Format) override {
+        return m_real->GetAdapterModeCount(Adapter, Format);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumAdapterModes(UINT Adapter, D3DFORMAT Format, UINT Mode, D3DDISPLAYMODE* pMode) override {
+        return m_real->EnumAdapterModes(Adapter, Format, Mode, pMode);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetAdapterDisplayMode(UINT Adapter, D3DDISPLAYMODE* pMode) override {
+        return m_real->GetAdapterDisplayMode(Adapter, pMode);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceType(UINT Adapter, D3DDEVTYPE DevType, D3DFORMAT AdapterFormat, D3DFORMAT BackBufferFormat, BOOL bWindowed) override {
+        return m_real->CheckDeviceType(Adapter, DevType, AdapterFormat, BackBufferFormat, bWindowed);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceFormat(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT AdapterFormat, DWORD Usage, D3DRESOURCETYPE RType, D3DFORMAT CheckFormat) override {
+        return m_real->CheckDeviceFormat(Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceMultiSampleType(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat, BOOL Windowed, D3DMULTISAMPLE_TYPE MultiSampleType, DWORD* pQualityLevels) override {
+        return m_real->CheckDeviceMultiSampleType(Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType, pQualityLevels);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDepthStencilMatch(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT AdapterFormat, D3DFORMAT RenderTargetFormat, D3DFORMAT DepthStencilFormat) override {
+        return m_real->CheckDepthStencilMatch(Adapter, DeviceType, AdapterFormat, RenderTargetFormat, DepthStencilFormat);
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckDeviceFormatConversion(UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SourceFormat, D3DFORMAT TargetFormat) override {
+        return m_real->CheckDeviceFormatConversion(Adapter, DeviceType, SourceFormat, TargetFormat);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9* pCaps) override {
+        return m_real->GetDeviceCaps(Adapter, DeviceType, pCaps);
+    }
+
+    HMONITOR STDMETHODCALLTYPE GetAdapterMonitor(UINT Adapter) override {
+        return m_real->GetAdapterMonitor(Adapter);
+    }
+
+    // The key interception - wrap the device!
     HRESULT STDMETHODCALLTYPE CreateDevice(
-        UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags,
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        HWND hFocusWindow,
+        DWORD BehaviorFlags,
         D3DPRESENT_PARAMETERS* pPresentationParameters,
         IDirect3DDevice9** ppReturnedDeviceInterface) override
     {
         LogMsg("CreateDevice called - Adapter: %d, DeviceType: %d", Adapter, DeviceType);
+
         IDirect3DDevice9* realDevice = nullptr;
         HRESULT hr = m_real->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
                                           pPresentationParameters, &realDevice);
+
         if (SUCCEEDED(hr) && realDevice) {
             LogMsg("CreateDevice succeeded, wrapping device");
             *ppReturnedDeviceInterface = new WrappedD3D9Device(realDevice);
@@ -709,12 +587,13 @@ public:
             LogMsg("CreateDevice failed with HRESULT: 0x%08X", hr);
             *ppReturnedDeviceInterface = nullptr;
         }
+
         return hr;
     }
 };
 
 /**
- * Wrapped IDirect3D9Ex
+ * Wrapped IDirect3D9Ex - for games that use Direct3DCreate9Ex
  */
 class WrappedD3D9Ex : public IDirect3D9Ex {
 private:
@@ -724,9 +603,15 @@ public:
     WrappedD3D9Ex(IDirect3D9Ex* real) : m_real(real) {
         LogMsg("WrappedD3D9Ex created, wrapping IDirect3D9Ex at %p", real);
     }
-    ~WrappedD3D9Ex() { LogMsg("WrappedD3D9Ex destroyed"); }
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override { return m_real->QueryInterface(riid, ppvObj); }
+    ~WrappedD3D9Ex() {
+        LogMsg("WrappedD3D9Ex destroyed");
+    }
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
+        return m_real->QueryInterface(riid, ppvObj);
+    }
     ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
     ULONG STDMETHODCALLTYPE Release() override {
         ULONG count = m_real->Release();
@@ -734,6 +619,7 @@ public:
         return count;
     }
 
+    // IDirect3D9 methods
     HRESULT STDMETHODCALLTYPE RegisterSoftwareDevice(void* pInitializeFunction) override { return m_real->RegisterSoftwareDevice(pInitializeFunction); }
     UINT STDMETHODCALLTYPE GetAdapterCount() override { return m_real->GetAdapterCount(); }
     HRESULT STDMETHODCALLTYPE GetAdapterIdentifier(UINT Adapter, DWORD Flags, D3DADAPTER_IDENTIFIER9* pIdentifier) override { return m_real->GetAdapterIdentifier(Adapter, Flags, pIdentifier); }
@@ -762,6 +648,7 @@ public:
         return hr;
     }
 
+    // IDirect3D9Ex methods
     UINT STDMETHODCALLTYPE GetAdapterModeCountEx(UINT Adapter, const D3DDISPLAYMODEFILTER* pFilter) override { return m_real->GetAdapterModeCountEx(Adapter, pFilter); }
     HRESULT STDMETHODCALLTYPE EnumAdapterModesEx(UINT Adapter, const D3DDISPLAYMODEFILTER* pFilter, UINT Mode, D3DDISPLAYMODEEX* pMode) override { return m_real->EnumAdapterModesEx(Adapter, pFilter, Mode, pMode); }
     HRESULT STDMETHODCALLTYPE GetAdapterDisplayModeEx(UINT Adapter, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override { return m_real->GetAdapterDisplayModeEx(Adapter, pMode, pRotation); }
@@ -786,44 +673,53 @@ public:
     }
 };
 
-// Load configuration from ini file
+// Load configuration from ini file (optional - defaults are good for discovery)
 void LoadConfig() {
     char path[MAX_PATH];
     GetModuleFileNameA(nullptr, path, MAX_PATH);
+
     char* lastSlash = strrchr(path, '\\');
     if (lastSlash) {
         strcpy(lastSlash + 1, "camera_proxy.ini");
     }
 
+    // Check if ini file exists
     DWORD attrib = GetFileAttributesA(path);
-    if (attrib == INVALID_FILE_ATTRIBUTES) return;
+    if (attrib == INVALID_FILE_ATTRIBUTES) {
+        // No ini file - use defaults (logging enabled)
+        return;
+    }
 
+    g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", 4, path);
+    g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", -1, path);
+    g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", 0, path);
     g_config.enableLogging = GetPrivateProfileIntA("CameraProxy", "EnableLogging", 1, path) != 0;
-    g_config.diagnosticFrames = GetPrivateProfileIntA("CameraProxy", "DiagnosticFrames", 5, path);
+    g_config.logAllConstants = GetPrivateProfileIntA("CameraProxy", "LogAllConstants", 1, path) != 0;
+    g_config.autoDetectMatrices = GetPrivateProfileIntA("CameraProxy", "AutoDetectMatrices", 1, path) != 0;
 
     char buf[64];
-    GetPrivateProfileStringA("CameraProxy", "Aspect", "1.7778", buf, sizeof(buf), path);
-    g_config.aspect = (float)atof(buf);
-    GetPrivateProfileStringA("CameraProxy", "ZNear", "10.0", buf, sizeof(buf), path);
-    g_config.zNear = (float)atof(buf);
-    GetPrivateProfileStringA("CameraProxy", "ZFar", "100000.0", buf, sizeof(buf), path);
-    g_config.zFar = (float)atof(buf);
+    GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
+    g_config.minFOV = (float)atof(buf);
+    GetPrivateProfileStringA("CameraProxy", "MaxFOV", "2.5", buf, sizeof(buf), path);
+    g_config.maxFOV = (float)atof(buf);
 }
 
 // DLL entry point
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+
         LoadConfig();
 
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
             LogMsg("=== Mirror's Edge Camera Proxy for RTX Remix ===");
-            LogMsg("=== VP AUTO-DETECT MODE ===");
-            LogMsg("Scanning all SetVertexShaderConstantF for ViewProjection signatures");
-            LogMsg("Diagnostic frames: %d", g_config.diagnosticFrames);
+            LogMsg("=== CAMERA EXTRACTION MODE ===");
+            LogMsg("View matrix: c5-c8 (confirmed from log analysis)");
+            LogMsg("Projection: Synthetic 90deg FOV");
         }
 
+        // Load the real Remix d3d9.dll
         char path[MAX_PATH];
         GetModuleFileNameA(hinstDLL, path, MAX_PATH);
         char* lastSlash = strrchr(path, '\\');
@@ -872,27 +768,33 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 extern "C" {
     IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
         LogMsg("Direct3DCreate9 called (SDK version: %d)", SDKVersion);
+
         if (!g_origDirect3DCreate9) {
             LogMsg("ERROR: g_origDirect3DCreate9 is null!");
             return nullptr;
         }
+
         IDirect3D9* realD3D9 = g_origDirect3DCreate9(SDKVersion);
         if (!realD3D9) {
             LogMsg("ERROR: Original Direct3DCreate9 returned null!");
             return nullptr;
         }
+
         LogMsg("Wrapping IDirect3D9");
         return new WrappedD3D9(realD3D9);
     }
 
     HRESULT WINAPI Proxy_Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3D) {
         LogMsg("Direct3DCreate9Ex called (SDK version: %d)", SDKVersion);
+
         if (!g_origDirect3DCreate9Ex) {
             LogMsg("ERROR: g_origDirect3DCreate9Ex is null!");
             return E_FAIL;
         }
+
         IDirect3D9Ex* realD3D9Ex = nullptr;
         HRESULT hr = g_origDirect3DCreate9Ex(SDKVersion, &realD3D9Ex);
+
         if (SUCCEEDED(hr) && realD3D9Ex) {
             LogMsg("Wrapping IDirect3D9Ex");
             *ppD3D = new WrappedD3D9Ex(realD3D9Ex);
@@ -900,31 +802,39 @@ extern "C" {
             LogMsg("ERROR: Original Direct3DCreate9Ex failed: 0x%08X", hr);
             *ppD3D = nullptr;
         }
+
         return hr;
     }
 
+    // D3DPERF forwarding functions
     int WINAPI Proxy_D3DPERF_BeginEvent(D3DCOLOR col, LPCWSTR name) {
         if (g_origD3DPERF_BeginEvent) return g_origD3DPERF_BeginEvent(col, name);
         return 0;
     }
+
     int WINAPI Proxy_D3DPERF_EndEvent(void) {
         if (g_origD3DPERF_EndEvent) return g_origD3DPERF_EndEvent();
         return 0;
     }
+
     DWORD WINAPI Proxy_D3DPERF_GetStatus(void) {
         if (g_origD3DPERF_GetStatus) return g_origD3DPERF_GetStatus();
         return 0;
     }
+
     BOOL WINAPI Proxy_D3DPERF_QueryRepeatFrame(void) {
         if (g_origD3DPERF_QueryRepeatFrame) return g_origD3DPERF_QueryRepeatFrame();
         return FALSE;
     }
+
     void WINAPI Proxy_D3DPERF_SetMarker(D3DCOLOR col, LPCWSTR name) {
         if (g_origD3DPERF_SetMarker) g_origD3DPERF_SetMarker(col, name);
     }
+
     void WINAPI Proxy_D3DPERF_SetOptions(DWORD options) {
         if (g_origD3DPERF_SetOptions) g_origD3DPERF_SetOptions(options);
     }
+
     void WINAPI Proxy_D3DPERF_SetRegion(D3DCOLOR col, LPCWSTR name) {
         if (g_origD3DPERF_SetRegion) g_origD3DPERF_SetRegion(col, name);
     }
