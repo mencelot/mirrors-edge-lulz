@@ -1,0 +1,13 @@
+# Build artifacts
+*.obj
+*.lib
+*.exp
+*.dll
+build_log.txt
+build_output.txt
+
+# Logs
+camera_proxy.log
+
+# Backups
+*_backup_*.cpp
